@@ -1,0 +1,497 @@
+---
+title: "Network-improvestructure"
+author: "Yunran Chen"
+date: "5/3/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#install.packages("GPfit")
+library(GPfit)
+library(MASS)
+library(dplyr)
+library(purrr)
+#install.packages("devtools")
+#library("devtools")
+library(tidyr)
+library(reshape2)
+library("forcats")
+library(mvtnorm)
+#install.packages("rbenchmark")
+library(rbenchmark)
+#install.packages("microbenchmark")
+library(microbenchmark)
+library("coda")
+library(ggplot2)
+```
+
+##SImulation dataset
+
+```{r}
+k_u=0.01
+k_x=0.01
+N=40
+V=15
+H=2
+set.seed(123)
+
+c_u=corr_matrix(X = 1:N,beta = log10(k_u),corr = list(type="exponential",power=2))
+c_x=corr_matrix(X = 1:N,beta = log10(k_x),corr = list(type="exponential",power=2))
+
+mu=mvrnorm(n=1,mu=rep(0,N),Sigma = c_u)
+X=mvrnorm(n=V*H,mu=rep(0,N),Sigma = c_x)
+X_arr=array(data = as.vector(X),dim = c(V,H,N)) 
+pi_arr=array(dim=c(V,V,N))
+Y_arr=array(dim=c(V,V,N))
+for (t in 1:N){
+  pi_arr[,,t]=1/(1+exp(-(X_arr[,,t]%*%t(X_arr[,,t])+mu[t])))
+  for (i in 1:V){
+    for (j in 1:V){
+      Y_arr[i,j,t]=sample(x = c(1,0),size = 1,prob = c(pi_arr[i,j,t],1-pi_arr[i,j,t]))
+    }
+  }
+}
+save(Y_arr,file="Y_arr_sed123.RData")
+
+```
+
+
+##load data
+```{r}
+load("Y_arr_sed123.RData")
+```
+
+
+##prepare
+
+```{r}
+# Naive sampler for PG(1, z)
+# (based on the finite approximation of infinite sum)
+rpg_naive = function(z, n_terms = 100){
+  g = rexp(n_terms, 1)
+  out = 1 / (2*pi**2) * sum(g / ((1:n_terms - 1/2)**2 + z**2 / (4*pi**2)))
+  return(out)
+}
+```
+
+
+
+##Inference
+
+Only cache pi.
+Improve sampling for X
+reduce all the loop to map instead of something dealing with assigning values.
+
+```{r}
+
+N=40
+V=15
+
+H_star=10
+k_u0=k_x0=0.05
+a1=a2=2
+niter=5000
+burnin=1000
+set.seed(456)
+```
+
+#MCMC start here
+
+```{r}
+now=proc.time()
+#MCMCme=function(N=40,V=15,H_star=10,k_u0=0.05,k_x0=0.05,a1=2,a2=2,niter=5000,burnin=1000,Y_arr=Y_arr){
+  p = progress_estimated(niter, min_time = 0)
+##prior
+c_u0=corr_matrix(X = 1:N,beta = log10(k_u0),corr = list(type="exponential",power=2))
+K_mu_inv=chol2inv(chol(c_u0+diag(rep(1e-8,N)))) #
+c_x0=corr_matrix(X = 1:N,beta = log10(k_x0),corr = list(type="exponential",power=2))
+K_x_inv=chol2inv(chol(c_x0+diag(rep(1e-8,N)))) #
+mu0=mvrnorm(n=1,mu=rep(0,N),Sigma = c_u0)
+v1=rgamma(n = 1,shape = a1,rate = 1)
+vl=rgamma(n = H_star-1,shape = a2,rate = 1)
+vv=c(v1,vl)
+tao=accumulate(vv,prod)
+X_arr0=array(dim=c(V,H_star,N))
+for(h in 1:H_star){
+  X_arr0[,h,]=mvrnorm(n=V,mu=rep(0,N),Sigma = (1/tao[h])*c_x0)
+}
+
+#Store the result: create empty bags
+#Only cache pi here.
+#W_cache=matrix(nrow=V*V*N,ncol=niter)
+#mu_cache=matrix(nrow=N,ncol=niter)
+#X_cache=matrix(nrow=V*H_star*N,ncol=niter)
+#tao_cache=matrix(nrow=H_star,ncol=niter)
+pi_arr_est_cache=matrix(nrow=V*V*N,ncol=niter)
+
+##posterior
+for (iter in 1:niter){
+
+#sample W:using X_arr0,mu0
+S=map(1:N,~X_arr0[,,.x]%*%t(X_arr0[,,.x]))
+W=map(1:N,~apply(S[[.x]]+mu0[.x],1,function(x){return(map_dbl(.x = x,.f = ~rpg_naive(z = .x)))}))
+W=W%>%unlist(.)%>%array(data = .,dim=c(V,V,N))
+#W_cache[,iter]=W%>%as.vector(.)
+
+#sample mu0:using W
+Sigma_mu0=(apply(X = W,MARGIN = 3,FUN = sum))%>%diag(.)
+Sigma_mu=chol2inv(chol(Sigma_mu0+K_mu_inv))
+mu_mu=Sigma_mu%*%map_dbl(1:N,~sum(Y_arr[,,.x]-0.5-S[[.x]]*W[,,.x]))
+mu0=mvrnorm(1,mu_mu,Sigma_mu)
+#mu_cache[,iter]=mu0
+
+#sample X_arr0:using tao,W,X_arr0
+prior_sig_x=diag(tao) %x% K_x_inv
+#X_mat=matrix(0,nrow = N*H_star,ncol=V)
+
+update_x=function(v){
+  X_tilta=matrix(0,nrow = (V-1)*N,ncol = H_star*N)
+  w=W[-v,v,]%>%t(.)%>%as.vector(.)
+  Omega=diag(w)
+  for (t in 1:N){
+    X_tilta[seq(from=t,to=(V-1)*N,by=N),seq(from=t,to=H_star*N,by=N)]=X_arr0[-v,,t]
+}
+  Sigma_x0=t(X_tilta)%*%Omega%*%X_tilta+prior_sig_x
+  Sigma_x=chol2inv(chol(Sigma_x0))
+  mu_x=t(X_tilta)%*%(Y_arr[-v,v,]%>%t(.)%>%as.vector()-0.5-w*rep(mu,V-1))
+  mu_x=Sigma_x%*%mu_x
+  X_mat=rmvnorm(n = 1,mean = mu_x,sigma = Sigma_x)%>%matrix(.,nrow=H_star,ncol=N,byrow=T)
+  return(X_mat)
+}
+X_list=map(1:V,~update_x(.x))
+X_longmat=do.call(rbind,X_list)
+X_arr=array(X_longmat,dim=c(H_star,V,N))
+for (t in 1:N){
+  X_arr0[,,t]=t(X_arr[,,t])
+}
+#X_cache[,iter]=X_arr0%>%as.vector(),
+
+#sample tao,v:using X_longmat,v,
+
+xKx=apply(X_longmat,1,function(x){t(x)%*%K_x_inv%*%x})%>%
+  matrix(.,nrow = V,ncol=H_star,byrow=T)%>%
+  apply(.,2,sum)
+tao_1=c(1,vv[-1])%>%accumulate(.,prod)
+rate1=1+0.5*sum(tao_1*xKx)
+v1=rgamma(n = 1,shape = a1+V*N*H_star/2,rate = rate1)
+rate_l=map_dbl(1:(H_star-1),~map_dbl((.x+1):H_star,~prod(vv[1:.][-(.x+1)])*xKx[.])%>%sum(.))
+vl=map_dbl(2:H_star,~rgamma(n = 1,shape = a2+V*N*(H_star-.x+1)/2,rate = 1+0.5*rate_l[.x-1]))
+vv=c(v1,vl)
+tao=accumulate(vv,prod)
+#tao_cache[,iter]=tao
+
+#calculate pi!!!Finally!!!:using X_arr0,mu0,
+pi_vec=map(1:N,~1/(1+exp(-(X_arr0[,,.x]%*%t(X_arr0[,,.x])+mu0[.x]))))%>%unlist(.)
+pi_arr_est_cache[,iter]=pi_vec
+
+p$tick()$print()
+}
+#MCMCres=list(W_est=W_cache,mu_est=mu_cache,X_est=X_cache,tao_est=tao_cache,pi_est=pi_arr_est_cache)
+MCMCres=pi_arr_est_cache
+save(MCMCres,file="MCMCres_seed456.RData")
+#return(MCMCres)
+#}
+
+#givemeMCMC=MCMCme(N=40,V=15,H_star=10,k_u0=0.05,k_x0=0.05,a1=2,a2=2,niter=5000,burnin=1000,Y_arr=Y_arr)
+future=proc.time()
+future-now
+
+# 10 iteration 113s
+# 10 iteration 22s --improve X_tilta
+# 10 iteration 19s --reduce 2 for loop
+```
+
+#posterior check
+```{r}
+iter=5000
+load("MCMCres_seed456.RData")
+
+Pi_est=MCMCres
+##decide the burnin
+ggdf=data_frame(index=1:iter,pi=Pi_est[iter,])
+ggplot(data=ggdf,mapping = aes(x = index,y = pi))+geom_line()
+effsize=apply(Pi_est,1,function(x){effectiveSize(as.mcmc(x))})
+iter-1
+hist(effsize)
+min(effsize)
+max(effsize)
+which.min(effsize)
+
+#without burnin. check the posterior
+#apply(a,c(2,3),sum) colsum
+pi_est_pos=Pi_est%>%apply(.,1,mean)
+pi_est_pos_arr=array(pi_est_pos,dim=c(V,V,N))
+for (t in 1:N){
+  mat=pi_est_pos_arr[,,t]
+  colnames(mat)=paste0("col",1:V)
+  rownames(mat)=paste0("row",1:V)
+  longData=melt(mat)
+  mat_true=pi_arr[,,t]
+  colnames(mat_true)=paste0("col",1:V)
+  rownames(mat_true)=paste0("row",1:V)
+  longData_true=melt(mat_true)
+  longData=longData%>%mutate(index="estimate")
+  longData_true=longData_true%>%mutate(index="true")
+  longData_all=bind_rows(longData,longData_true)
+  longData_all=as_tibble(longData_all)%>%mutate(index=as.factor(index))
+  longData_all=longData_all%>%mutate(Var1=fct_rev(Var1))
+  jpeg(filename=paste0(t,".jpeg"))
+p=ggplot(longData_all, aes(x = Var2, y = Var1)) + 
+  geom_raster(aes(fill=value)) + facet_wrap(~ index)+
+  scale_fill_gradient(low="grey90", high="red") +
+  labs(x="col", y="row", title="Matrix") +
+  theme_bw() + theme(axis.text.x=element_text(size=9, angle=0, vjust=0.3),
+                     axis.text.y=element_text(size=9),
+                     plot.title=element_text(size=11))
+print(p)
+  dev.off()
+}
+
+```
+
+
+```{r}
+pi_true_vec=pi_arr%>%as.vector(.)
+pi_estimate_vec=pi_est_pos
+pi_ggdf=data_frame(true=pi_true_vec,estimate=pi_estimate_vec)
+ggplot(data = pi_ggdf,mapping = aes(x=true,y=estimate))+geom_point()
+
+##rm the diagonal
+pi_arr_rm=pi_arr
+pi_est_pos_arr_rm=pi_est_pos_arr
+for (t in 1:N){
+  diag(pi_arr_rm[,,t])=NA
+  diag(pi_est_pos_arr_rm[,,t])=NA
+}
+pi_true_vec=pi_arr_rm%>%as.vector(.)
+pi_estimate_vec=pi_est_pos_arr_rm%>%as.vector(.)
+pi_ggdf=data_frame(true=pi_true_vec,estimate=pi_estimate_vec)
+ggplot(data = pi_ggdf,mapping = aes(x=true,y=estimate))+geom_point()
+
+```
+
+##ROC
+
+```{r}
+library("pROC")
+yij_vec=Y_arr%>%as.vector(.)
+
+
+auc(roc(yij_vec,pi_estimate_vec))
+plot(roc(yij_vec,pi_estimate_vec))
+for (i in seq(0,1,by=0.1)){
+  abline(h=i,lty=2)
+  abline(v=i,lty=2)
+}
+
+##rm the diagonal
+Y_arr_rm=Y_arr
+for (t in 1:N){
+  diag(Y_arr_rm[,,t])=NA
+}
+yij_vec=Y_arr_rm%>%as.vector(.)
+
+
+auc(roc(na.omit(yij_vec),na.omit(pi_estimate_vec)))
+plot(roc(na.omit(yij_vec),na.omit(pi_estimate_vec)))
+for (i in seq(0,1,by=0.1)){
+  abline(h=i,lty=2)
+  abline(v=i,lty=2)
+}
+```
+
+
+
+
+
+
+## try some other prediction check
+
+```{r}
+#colsum for pi
+
+apply(a,c(2,3),sum)
+```
+
+#see the slowest part in update X_tilta: 
+
+create that weired matrix --  cannot be improved by mapreduce. need more efficient data structure.cannot bypass the problem by multiplication. Still have this form.
+sparse matrix multiplication is more efficient than this loop.
+
+```{r}
+benchmark(
+  X_tilta=matrix(0,nrow = (V-1)*N,ncol = H_star*N),
+  w=W[-v,v,]%>%t(.)%>%as.vector(.),
+  Omega=diag(w),
+  for (t in 1:N){
+    mat_s=matrix(0,nrow=N,ncol=N)
+    mat_s[t,t]=1
+    X_tilta=(X_arr0[-v,,t] %x% mat_s)+X_tilta
+  },
+  
+  Sigma_x0=t(X_tilta)%*%Omega%*%X_tilta+prior_sig_x,
+  Sigma_x=chol2inv(chol(Sigma_x0)),
+  mu_x=t(X_tilta)%*%(Y_arr[-v,v,]%>%t(.)%>%as.vector()-0.5-w*rep(mu,V-1)),
+  mu_x=Sigma_x%*%mu_x,
+  X_mat=rmvnorm(n = 1,mean = mu_x,sigma = Sigma_x)%>%matrix(.,nrow=H_star,ncol=N,byrow=T),
+  replications=20
+)%>%View(.)
+```
+
+
+# try to reduce loop
+
+```{r}
+assignment=function(){
+  S1=map(1:N,function(t){
+  X_arr0[,,t]%*%t(X_arr0[,,t])
+  #apply(S[,,t]+mu0[t],1,function(x){return(map_dbl(.x = x,.f = ~rpg_naive(z = .x)))})
+})
+  return(array(.))
+}
+benchmark(for(t in 1:N){
+  S[,,t]=X_arr0[,,t]%*%t(X_arr0[,,t])
+  W[,,t]=apply(S[,,t]+mu0[t],1,function(x){return(map_dbl(.x = x,.f = ~rpg_naive(z = .x)))})
+},
+
+S1=map(1:N,function(t){
+  X_arr0[,,t]%*%t(X_arr0[,,t])
+  #apply(S[,,t]+mu0[t],1,function(x){return(map_dbl(.x = x,.f = ~rpg_naive(z = .x)))})
+}),
+replications = 200
+)
+a_mat=matrix(rep(1:3,each=3),nrow=3)
+b_mat=matrix(rep(1:3,each=3),nrow=3,byrow=T)
+A_list=list(a_mat,b_mat)
+b=A_list %>% array(.,dim=c(3,3,2))
+map(1:2,function(t){
+  X_arr0[,,t]%*%t(X_arr0[,,t])
+  #apply(S[,,t]+mu0[t],1,function(x){return(map_dbl(.x = x,.f = ~rpg_naive(z = .x)))})
+})
+A_arr=array(dim=c(3,3,2))
+A_arr[,,1]=a_mat
+A_arr[,,2]=b_mat
+##map cannot 
+a_mat=matrix(nrow=3,ncol=3)
+a_mat[c(1,3),c(1,3)]=matrix(1:4,nrow=2,byrow=T)
+map(.x = 1:3,.f = function(x){a_mat[x,]=x+1})
+```
+
+```{r}
+a=benchmark(for (t in 1:N){
+    mat_s=matrix(0,nrow=N,ncol=N)
+    mat_s[t,t]=1
+    X_tilta1=(X_arr0[-v,,t] %x% mat_s)+X_tilta1
+},
+new(),
+replications = 20
+)
+View(a)
+new=function(){
+  X_tilta=matrix(0,nrow=(V-1)*N,ncol=H_star*N)
+  for (t in 1:N){
+    X_tilta[seq(from=t,to=(V-1)*N,by=N),seq(from=t,to=H_star*N,by=N)]=X_arr0[-v,,t]
+}
+}
+all.equal(X_tilta,X_tilta1)
+```
+
+```{r}
+benchmark(
+  ori(),
+testme(),
+replications = 40)%>%View(.)
+ori=function(){
+S=array(dim=c(V,V,N))
+for(t in 1:N){
+  S[,,t]=X_arr0[,,t]%*%t(X_arr0[,,t])
+  W[,,t]=apply(S[,,t]+mu0[t],1,function(x){return(map_dbl(.x = x,.f = ~rpg_naive(z = .x)))})
+}
+}
+
+for(t in 1:N){
+  S[,,t]=X_arr0[,,t]%*%t(X_arr0[,,t])}
+testme=function(){
+S=map(1:N,~X_arr0[,,.x]%*%t(X_arr0[,,.x]))
+W=map(1:N,~apply(S[[.x]]+mu0[.x],1,function(x){return(map_dbl(.x = x,.f = ~rpg_naive(z = .x)))}))
+W=W%>%unlist(.)%>%array(data = .,dim=c(V,V,N))}
+
+microbenchmark(
+for(h in 2:H_star){
+  rate_l[h-1]=map_dbl(h:H_star,~prod(vv[1:.][-h])*xKx[.])%>%sum(.)
+},
+rate_l=map_dbl(1:(H_star-1),~map_dbl((.x+1):H_star,~prod(vv[1:.][-(.x+1)])*xKx[.])%>%sum(.)),
+replications = 10
+)
+
+```
+
+#Note
+
+```{r}
+#may help 
+array_branch(x, 1) 
+```
+
+#burnin
+
+#posterior check
+
+```{r}
+iter=5000
+burnin=1000
+load("MCMCres_seed456.RData")
+
+Pi_est_b=MCMCres[,(burnin+1):iter]
+##decide the burnin
+ggdf=data_frame(index=1:iter,pi=Pi_est[iter,])
+ggplot(data=ggdf,mapping = aes(x = index,y = pi))+geom_line()
+effsize=apply(Pi_est_b,1,function(x){effectiveSize(as.mcmc(x))})
+iter-1
+hist(effsize)
+min(effsize) #2096
+max(effsize) #5829
+which.min(effsize)
+
+pi_est_pos_b=Pi_est_b%>%apply(.,1,mean)
+pi_est_pos_arr=array(pi_est_pos_b,dim=c(V,V,N))
+
+```
+
+
+```{r}
+
+##rm the diagonal
+pi_arr_rm=pi_arr
+pi_est_pos_arr_rm=pi_est_pos_arr
+for (t in 1:N){
+  diag(pi_arr_rm[,,t])=NA
+  diag(pi_est_pos_arr_rm[,,t])=NA
+}
+pi_true_vec=pi_arr_rm%>%as.vector(.)
+pi_estimate_vec=pi_est_pos_arr_rm%>%as.vector(.)
+pi_ggdf=data_frame(true=pi_true_vec,estimate=pi_estimate_vec)
+ggplot(data = pi_ggdf,mapping = aes(x=true,y=estimate))+geom_point()
+
+```
+
+
+```{r}
+library("pROC")
+
+##rm the diagonal
+Y_arr_rm=Y_arr
+for (t in 1:N){
+  diag(Y_arr_rm[,,t])=NA
+}
+yij_vec=Y_arr_rm%>%as.vector(.)
+
+
+auc(roc(na.omit(yij_vec),na.omit(pi_estimate_vec))) #0.7631
+plot(roc(na.omit(yij_vec),na.omit(pi_estimate_vec)))
+for (i in seq(0,1,by=0.1)){
+  abline(h=i,lty=2)
+  abline(v=i,lty=2)
+}
+```
