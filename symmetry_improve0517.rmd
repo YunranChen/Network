@@ -1,0 +1,412 @@
+---
+title: "Network-improvestructure"
+author: "Yunran Chen"
+date: "5/3/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#install.packages("GPfit")
+library(GPfit)
+library(MASS)
+library(dplyr)
+library(purrr)
+#install.packages("devtools")
+#library("devtools")
+library(tidyr)
+library(reshape2)
+library("forcats")
+library(mvtnorm)
+#install.packages("rbenchmark")
+library(rbenchmark)
+#install.packages("microbenchmark")
+library(microbenchmark)
+library("coda")
+library(ggplot2)
+theme_set(theme_bw())
+```
+
+##SImulation dataset
+
+```{r}
+k_u=0.01
+k_x=0.01
+N=40
+V=15
+H=2
+set.seed(123)
+
+c_u=corr_matrix(X = 1:N,beta = log10(k_u),corr = list(type="exponential",power=2))
+c_x=corr_matrix(X = 1:N,beta = log10(k_x),corr = list(type="exponential",power=2))
+
+mu=mvrnorm(n=1,mu=rep(0,N),Sigma = c_u)
+X=mvrnorm(n=V*H,mu=rep(0,N),Sigma = c_x)
+X_arr=array(data = as.vector(X),dim = c(V,H,N)) 
+pi_arr=array(dim=c(V,V,N))
+Y_arr=array(dim=c(V,V,N))
+for (t in 1:N){
+  pi_arr[,,t]=1/(1+exp(-(X_arr[,,t]%*%t(X_arr[,,t])+mu[t])))
+  for (i in 2:V){
+    for (j in 1:(i-1)){
+      Y_arr[i,j,t]=sample(x = c(1,0),size = 1,prob = c(pi_arr[i,j,t],1-pi_arr[i,j,t]))
+    }
+  }
+}
+save(Y_arr,file="Y_arr_sys_sed123.RData")
+
+```
+
+
+##load data
+```{r}
+load("Y_arr_sys_sed123.RData")
+```
+
+
+##prepare
+
+```{r}
+# Naive sampler for PG(1, z)
+# (based on the finite approximation of infinite sum)
+rpg_naive = function(z, n_terms = 100){
+  g = rexp(n_terms, 1)
+  out = 1 / (2*(pi^2)) * sum(g / ((1:n_terms - 1/2)^2 + z^2 / (4*(pi^2))))
+  return(out)
+}
+```
+
+##Inference
+
+```{r}
+
+N=40
+V=15
+
+H_star=10
+k_u0=k_x0=0.05
+a1=a2=2
+niter=5000
+burnin=1000
+set.seed(456)
+```
+
+#MCMC start here
+
+```{r}
+now=proc.time()
+#MCMCme=function(N=40,V=15,H_star=10,k_u0=0.05,k_x0=0.05,a1=2,a2=2,niter=5000,burnin=1000,Y_arr=Y_arr){
+  p = progress_estimated(niter, min_time = 0)
+##prior
+c_u0=corr_matrix(X = 1:N,beta = log10(k_u0),corr = list(type="exponential",power=2))
+K_mu_inv=chol2inv(chol(c_u0+diag(rep(1e-8,N)))) #inverse
+c_x0=corr_matrix(X = 1:N,beta = log10(k_x0),corr = list(type="exponential",power=2))
+K_x_inv=chol2inv(chol(c_x0+diag(rep(1e-8,N)))) #inverse
+mu0=mvrnorm(n=1,mu=rep(0,N),Sigma = c_u0)
+v1=rgamma(n = 1,shape = a1,rate = 1)
+vl=rgamma(n = H_star-1,shape = a2,rate = 1) #(H_star-1)*1 vec
+vv=c(v1,vl)
+tao=accumulate(vv,prod)
+X_arr0=array(dim=c(V,H_star,N))
+for(h in 1:H_star){
+  X_arr0[,h,]=mvrnorm(n=V,mu=rep(0,N),Sigma = (1/tao[h])*c_x0)
+}
+
+#Store the result: create empty bags
+
+#W_cache=matrix(nrow=V*V*N,ncol=niter)
+mu_cache=matrix(nrow=N,ncol=niter)
+#X_cache=matrix(nrow=V*H_star*N,ncol=niter)
+#tao_cache=matrix(nrow=H_star,ncol=niter)
+pi_arr_est_cache=matrix(nrow=V*V*N,ncol=niter)
+
+#preparation:transfer Y_arr to symmetric matrix without diagonal
+for (t in 1:N){
+  Y_arr[,,t][upper.tri(Y_arr[,,t])] = t(Y_arr[,,t])[upper.tri(Y_arr[,,t])]
+}
+
+
+##posterior
+for (iter in 1:niter){
+
+#sample W:using X_arr0,mu0
+S=map(1:N,~X_arr0[,,.x]%*%t(X_arr0[,,.x])) #S=Xt(X)
+W=array(data = NA,dim=c(V,V,N))
+for (t in 1:N){
+  W[,,t][lower.tri(W[,,t])]=map_dbl(S[[t]][lower.tri(S[[t]])],~rpg_naive(z = .x,n_terms = 100))
+}
+
+#sample mu0:using W
+Sigma_mu0=(apply(X = W,MARGIN = 3,FUN = sum,na.rm=TRUE))%>%diag(.)
+Sigma_mu=chol2inv(chol(Sigma_mu0+K_mu_inv))
+mu_mu=Sigma_mu%*%map_dbl(1:N,~sum(Y_arr[,,.x]-0.5-S[[.x]]*W[,,.x],na.rm = TRUE)) #W-upper NA
+mu0=mvrnorm(1,mu_mu,Sigma_mu)
+mu_cache[,iter]=mu0
+
+#sample X_arr0:using tao,W,X_arr0
+prior_sig_x=diag(tao) %x% K_x_inv
+for (t in 1:N){
+  W[,,t][upper.tri(W[,,t])] = t(W[,,t])[upper.tri(W[,,t])]
+}
+
+update_x=function(v){
+  X_tilta=matrix(0,nrow = (V-1)*N,ncol = H_star*N)
+  w=W[v,,]%>%t(.)%>%as.vector(.)%>%na.omit(.)%>%as.vector()
+  Omega=diag(w)
+  for (t in 1:N){
+    X_tilta[seq(from=t,to=(V-1)*N,by=N),seq(from=t,to=H_star*N,by=N)]=X_arr0[-v,,t]
+}
+  Sigma_x0=t(X_tilta)%*%Omega%*%X_tilta+prior_sig_x
+  Sigma_x=chol2inv(chol(Sigma_x0))
+  mu_x0=t(X_tilta)%*%(Y_arr[v,,]%>%t(.)%>%as.vector(.)%>%na.omit(.)%>%as.vector()-0.5-w*rep(mu,V-1))
+  mu_x=Sigma_x%*%mu_x0
+  X_mat=rmvnorm(n = 1,mean = mu_x,sigma = Sigma_x)%>%matrix(.,nrow=H_star,ncol=N,byrow=T)
+  return(X_mat)
+}
+X_list=map(1:V,~update_x(.x))
+X_longmat=do.call(rbind,X_list)
+X_arr=array(X_longmat,dim=c(H_star,V,N))
+for (t in 1:N){
+  X_arr0[,,t]=t(X_arr[,,t])
+}
+#X_cache[,iter]=X_arr0%>%as.vector(),
+
+#sample tao,v:using X_longmat,vv
+
+xKx=apply(X_longmat,1,function(x){t(x)%*%K_x_inv%*%x})%>%
+  matrix(.,nrow = H_star,ncol=V)%>%
+  apply(.,1,sum)
+tao_1=c(1,vv[-1])%>%accumulate(.,prod)
+rate1=1+0.5*sum(tao_1*xKx)
+v1=rgamma(n = 1,shape = a1+V*N*H_star/2,rate = rate1)
+rate_l=vector(length = H_star-1)
+for (h in 2:H_star){
+  rate_l[h-1]=map_dbl(h:H_star,~prod(vv[1:.x][-h])*xKx[.x])%>%sum(.)
+}
+vl=map_dbl(2:H_star,~rgamma(n = 1,shape = a2+V*N*(H_star-.x+1)/2,rate = 1+0.5*rate_l[.x-1]))
+vv=c(v1,vl)
+tao=accumulate(vv,prod)
+#tao_cache[,iter]=tao
+
+#calculate pi!!!Finally!!!:using X_arr0,mu0,
+pi_vec=map(1:N,~1/(1+exp(-(X_arr0[,,.x]%*%t(X_arr0[,,.x])+mu0[.x]))))%>%unlist(.)
+pi_arr_est_cache[,iter]=pi_vec
+
+p$tick()$print()
+}
+MCMCres=list(mu_est=mu_cache,pi_est=pi_arr_est_cache)
+save(MCMCres,file="MCMCres_sys_seed456.RData")
+#return(MCMCres)
+#}
+
+#givemeMCMC=MCMCme(N=40,V=15,H_star=10,k_u0=0.05,k_x0=0.05,a1=2,a2=2,niter=5000,burnin=1000,Y_arr=Y_arr)
+future=proc.time()
+future-now
+
+```
+
+#posterior check
+```{r}
+iter=5000
+load("MCMCres_sys_seed456.RData")
+
+Pi_est=MCMCres$pi_est
+##decide the burnin
+ggdf=data_frame(index=1:iter,pi=Pi_est[iter,])
+ggplot(data=ggdf,mapping = aes(x = index,y = pi))+geom_line()
+
+effsize=apply(Pi_est,1,function(x){effectiveSize(as.mcmc(x))})
+
+hist(effsize)
+min(effsize)
+max(effsize)
+which.min(effsize)
+
+effsize_b=apply(Pi_est[,(burnin+1):niter],1,function(x){effectiveSize(as.mcmc(x))})
+hist(effsize_b)
+min(effsize_b)
+max(effsize_b)
+which.min(effsize_b)
+
+#without burnin. check the posterior
+#apply(a,c(2,3),sum) colsum
+pi_est_pos=Pi_est%>%apply(.,1,mean)
+pi_est_pos_arr=array(pi_est_pos,dim=c(V,V,N))
+for (t in 1:N){
+  diag(pi_est_pos_arr[,,t])=NA
+  diag(pi_arr[,,t])=NA
+  mat=pi_est_pos_arr[,,t]
+  colnames(mat)=paste0("col",1:V)
+  rownames(mat)=paste0("row",1:V)
+  longData=melt(mat)
+  mat_true=pi_arr[,,t]
+  colnames(mat_true)=paste0("col",1:V)
+  rownames(mat_true)=paste0("row",1:V)
+  longData_true=melt(mat_true)
+  longData=longData%>%mutate(index="estimate")
+  longData_true=longData_true%>%mutate(index="true")
+  longData_all=bind_rows(longData,longData_true)
+  longData_all=as_tibble(longData_all)%>%mutate(index=as.factor(index))
+  longData_all=longData_all%>%mutate(Var1=fct_rev(Var1))
+  jpeg(filename=paste0(t,".jpeg"))
+p=ggplot(longData_all, aes(x = Var2, y = Var1)) + 
+  geom_raster(aes(fill=value)) + facet_wrap(~ index)+
+  scale_fill_gradient(low="grey90", high="red") +
+  labs(x="col", y="row", title="Matrix") +
+  theme_bw() + theme(axis.text.x=element_text(size=9, angle=0, vjust=0.3),
+                     axis.text.y=element_text(size=9),
+                     plot.title=element_text(size=11))
+print(p)
+  dev.off()
+}
+
+```
+
+
+```{r}
+pi_true_vec=pi_arr%>%as.vector(.)
+pi_estimate_vec=pi_est_pos
+pi_ggdf=data_frame(true=pi_true_vec,estimate=pi_estimate_vec)
+ggplot(data = pi_ggdf,mapping = aes(x=true,y=estimate))+geom_point()+geom_abline(slope = 1,intercept = 0)+coord_equal(ratio=1)
+
+##rm the diagonal
+pi_arr_rm=pi_arr
+pi_est_pos_arr_rm=pi_est_pos_arr
+for (t in 1:N){
+  diag(pi_arr_rm[,,t])=NA
+  diag(pi_est_pos_arr_rm[,,t])=NA
+}
+pi_true_vec=pi_arr_rm%>%as.vector(.)
+pi_estimate_vec=pi_est_pos_arr_rm%>%as.vector(.)
+pi_ggdf=data_frame(true=pi_true_vec,estimate=pi_estimate_vec)
+ggplot(data = pi_ggdf,mapping = aes(x=true,y=estimate))+geom_point()
+
+```
+
+##ROC
+
+```{r}
+library("pROC")
+yij_vec=Y_arr%>%as.vector(.)
+
+
+auc(roc(yij_vec,pi_estimate_vec))
+plot(roc(yij_vec,pi_estimate_vec))
+for (i in seq(0,1,by=0.1)){
+  abline(h=i,lty=2)
+  abline(v=i,lty=2)
+}
+
+##rm the diagonal
+Y_arr_rm=Y_arr
+for (t in 1:N){
+  diag(Y_arr_rm[,,t])=NA
+}
+yij_vec=Y_arr_rm%>%as.vector(.)
+
+
+auc(roc(na.omit(yij_vec),na.omit(pi_estimate_vec)))
+plot(roc(na.omit(yij_vec),na.omit(pi_estimate_vec)))
+for (i in seq(0,1,by=0.1)){
+  abline(h=i,lty=2)
+  abline(v=i,lty=2)
+}
+```
+
+
+#burnin
+
+#posterior check
+
+```{r}
+iter=5000
+burnin=1000
+load("MCMCres_seed456.RData")
+
+Pi_est_b=MCMCres[,(burnin+1):iter]
+##decide the burnin
+ggdf=data_frame(index=1:iter,pi=Pi_est[iter,])
+ggplot(data=ggdf,mapping = aes(x = index,y = pi))+geom_line()
+effsize=apply(Pi_est_b,1,function(x){effectiveSize(as.mcmc(x))})
+iter-1
+hist(effsize)
+min(effsize) #2096
+max(effsize) #5829
+which.min(effsize)
+
+pi_est_pos_b=Pi_est_b%>%apply(.,1,mean)
+pi_est_pos_arr=array(pi_est_pos_b,dim=c(V,V,N))
+
+```
+
+
+```{r}
+
+##rm the diagonal
+pi_arr_rm=pi_arr
+pi_est_pos_arr_rm=pi_est_pos_arr
+for (t in 1:N){
+  diag(pi_arr_rm[,,t])=NA
+  diag(pi_est_pos_arr_rm[,,t])=NA
+}
+pi_true_vec=pi_arr_rm%>%as.vector(.)
+pi_estimate_vec=pi_est_pos_arr_rm%>%as.vector(.)
+pi_ggdf=data_frame(true=pi_true_vec,estimate=pi_estimate_vec)
+ggplot(data = pi_ggdf,mapping = aes(x=true,y=estimate))+geom_point()
+
+```
+
+
+```{r}
+library("pROC")
+
+##rm the diagonal
+Y_arr_rm=Y_arr
+for (t in 1:N){
+  diag(Y_arr_rm[,,t])=NA
+}
+yij_vec=Y_arr_rm%>%as.vector(.)
+
+
+auc(roc(na.omit(yij_vec),na.omit(pi_estimate_vec))) #0.7631
+plot(roc(na.omit(yij_vec),na.omit(pi_estimate_vec)))
+for (i in seq(0,1,by=0.1)){
+  abline(h=i,lty=2)
+  abline(v=i,lty=2)
+}
+```
+
+##mu(t)
+
+```{r}
+
+time = 1:N
+mu_ggdf=data_frame(time=time,mu_est=apply(MCMCres$mu_est,1,mean),lower=apply(MCMCres$mu_est,1,quantile,0.025),upper=apply(MCMCres$mu_est,1,quantile,0.975))
+
+ggplot(mu_ggdf, aes(x=time))+geom_line(mapping = aes(y=mu_est),linetype="dashed")+geom_ribbon(aes(ymin=lower,ymax=upper),fill="lightblue",alpha=0.3)+geom_line(mapping = aes(y=mu_true),data = data_frame(mu_true=mu))
+```
+
+##pij(t)
+
+```{r}
+
+pi_ggdf=data_frame(row=rep(1:V,V*N),col=rep(rep(1:V,each=V),N),time=rep(1:N,each=V*V),pi_est=apply(Pi_est[,(burnin+1):niter],1,mean),lower=apply(Pi_est[,(burnin+1):niter],1,quantile,0.025),upper=apply(Pi_est[,(burnin+1):niter],1,quantile,0.975))
+#pi_ggdf_w=data_frame(row=rep(1:V,V*N),col=rep(rep(1:V,each=V),N),time=rep(1:N,each=V*V),pi_est=apply(Pi_est,1,mean),lower=apply(Pi_est,1,quantile,0.025),upper=apply(Pi_est,1,quantile,0.975))
+for (i in 2:V){
+  for (j in 1:(i-1)){
+    piij_ggdf=pi_ggdf%>%filter(row==i,col==j)%>%select(-row,-col)
+    jpeg(filename=paste0("pi_burnin_",i,j,".jpeg"))
+p=ggplot(piij_ggdf, aes(x=time))+geom_line(mapping = aes(y=pi_est),linetype="dashed")+geom_ribbon(aes(ymin=lower,ymax=upper),fill="lightblue",alpha=0.3)+geom_line(mapping = aes(y=pi_true),data = data_frame(pi_true=pi_arr[i,j,]))
+print(p)
+  dev.off()
+  }
+}
+pi32_ggdf=pi_ggdf%>%filter(row==3,col==2)%>%select(-row,-col)
+ggplot(pi32_ggdf, aes(x=time))+geom_line(mapping = aes(y=pi_est),linetype="dashed")+geom_ribbon(aes(ymin=lower,ymax=upper),fill="lightblue",alpha=0.3)+geom_line(mapping = aes(y=pi_true),data = data_frame(pi_true=pi_arr[3,2,]))
+
+pi92_ggdf=pi_ggdf%>%filter(row==9,col==2)%>%select(-row,-col)
+ggplot(pi92_ggdf, aes(x=time))+geom_line(mapping = aes(y=pi_est),linetype="dashed")+geom_ribbon(aes(ymin=lower,ymax=upper),fill="lightblue",alpha=0.3)+geom_line(mapping = aes(y=pi_true),data = data_frame(pi_true=pi_arr[9,2,]))
+
+```
+
+
