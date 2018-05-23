@@ -24,6 +24,7 @@ library(rbenchmark)
 library(microbenchmark)
 library("coda")
 library(ggplot2)
+theme_set(theme_bw())
 ```
 
 ##SImulation dataset
@@ -46,20 +47,20 @@ pi_arr=array(dim=c(V,V,N))
 Y_arr=array(dim=c(V,V,N))
 for (t in 1:N){
   pi_arr[,,t]=1/(1+exp(-(X_arr[,,t]%*%t(X_arr[,,t])+mu[t])))
-  for (i in 1:V){
-    for (j in 1:V){
+  for (i in 2:V){
+    for (j in 1:(i-1)){
       Y_arr[i,j,t]=sample(x = c(1,0),size = 1,prob = c(pi_arr[i,j,t],1-pi_arr[i,j,t]))
     }
   }
 }
-save(Y_arr,file="Y_arr_sed123.RData")
+save(Y_arr,file="Y_arr_sys_sed123.RData")
 
 ```
 
 
 ##load data
 ```{r}
-load("Y_arr_sed123.RData")
+load("Y_arr_sys_sed123.RData")
 ```
 
 
@@ -70,18 +71,12 @@ load("Y_arr_sed123.RData")
 # (based on the finite approximation of infinite sum)
 rpg_naive = function(z, n_terms = 100){
   g = rexp(n_terms, 1)
-  out = 1 / (2*pi**2) * sum(g / ((1:n_terms - 1/2)**2 + z**2 / (4*pi**2)))
+  out = 1 / (2*(pi^2)) * sum(g / ((1:n_terms - 1/2)^2 + z^2 / (4*(pi^2))))
   return(out)
 }
 ```
 
-
-
 ##Inference
-
-Only cache pi.
-Improve sampling for X
-reduce all the loop to map instead of something dealing with assigning values.
 
 ```{r}
 
@@ -104,12 +99,12 @@ now=proc.time()
   p = progress_estimated(niter, min_time = 0)
 ##prior
 c_u0=corr_matrix(X = 1:N,beta = log10(k_u0),corr = list(type="exponential",power=2))
-K_mu_inv=chol2inv(chol(c_u0+diag(rep(1e-8,N)))) #
+K_mu_inv=chol2inv(chol(c_u0+diag(rep(1e-8,N)))) #inverse
 c_x0=corr_matrix(X = 1:N,beta = log10(k_x0),corr = list(type="exponential",power=2))
-K_x_inv=chol2inv(chol(c_x0+diag(rep(1e-8,N)))) #
+K_x_inv=chol2inv(chol(c_x0+diag(rep(1e-8,N)))) #inverse
 mu0=mvrnorm(n=1,mu=rep(0,N),Sigma = c_u0)
 v1=rgamma(n = 1,shape = a1,rate = 1)
-vl=rgamma(n = H_star-1,shape = a2,rate = 1)
+vl=rgamma(n = H_star-1,shape = a2,rate = 1) #(H_star-1)*1 vec
 vv=c(v1,vl)
 tao=accumulate(vv,prod)
 X_arr0=array(dim=c(V,H_star,N))
@@ -118,44 +113,53 @@ for(h in 1:H_star){
 }
 
 #Store the result: create empty bags
-#Only cache pi here.
+
 #W_cache=matrix(nrow=V*V*N,ncol=niter)
-#mu_cache=matrix(nrow=N,ncol=niter)
+mu_cache=matrix(nrow=N,ncol=niter)
 #X_cache=matrix(nrow=V*H_star*N,ncol=niter)
 #tao_cache=matrix(nrow=H_star,ncol=niter)
 pi_arr_est_cache=matrix(nrow=V*V*N,ncol=niter)
+
+#preparation:transfer Y_arr to symmetric matrix without diagonal
+for (t in 1:N){
+  Y_arr[,,t][upper.tri(Y_arr[,,t])] = t(Y_arr[,,t])[upper.tri(Y_arr[,,t])]
+}
+
 
 ##posterior
 for (iter in 1:niter){
 
 #sample W:using X_arr0,mu0
-S=map(1:N,~X_arr0[,,.x]%*%t(X_arr0[,,.x]))
-W=map(1:N,~apply(S[[.x]]+mu0[.x],1,function(x){return(map_dbl(.x = x,.f = ~rpg_naive(z = .x)))}))
-W=W%>%unlist(.)%>%array(data = .,dim=c(V,V,N))
-#W_cache[,iter]=W%>%as.vector(.)
+S=map(1:N,~X_arr0[,,.x]%*%t(X_arr0[,,.x])) #S=Xt(X)
+W=array(data = NA,dim=c(V,V,N))
+for (t in 1:N){
+  W[,,t][lower.tri(W[,,t])]=map_dbl(S[[t]][lower.tri(S[[t]])],~rpg_naive(z = .x,n_terms = 100))
+}
 
 #sample mu0:using W
-Sigma_mu0=(apply(X = W,MARGIN = 3,FUN = sum))%>%diag(.)
+Sigma_mu0=(apply(X = W,MARGIN = 3,FUN = sum,na.rm=TRUE))%>%diag(.)
 Sigma_mu=chol2inv(chol(Sigma_mu0+K_mu_inv))
-mu_mu=Sigma_mu%*%map_dbl(1:N,~sum(Y_arr[,,.x]-0.5-S[[.x]]*W[,,.x]))
+mu_mu=Sigma_mu%*%map_dbl(1:N,~sum(Y_arr[,,.x]-0.5-S[[.x]]*W[,,.x],na.rm = TRUE)) #W-upper NA
 mu0=mvrnorm(1,mu_mu,Sigma_mu)
-#mu_cache[,iter]=mu0
+mu_cache[,iter]=mu0
 
 #sample X_arr0:using tao,W,X_arr0
 prior_sig_x=diag(tao) %x% K_x_inv
-#X_mat=matrix(0,nrow = N*H_star,ncol=V)
+for (t in 1:N){
+  W[,,t][upper.tri(W[,,t])] = t(W[,,t])[upper.tri(W[,,t])]
+}
 
 update_x=function(v){
   X_tilta=matrix(0,nrow = (V-1)*N,ncol = H_star*N)
-  w=W[-v,v,]%>%t(.)%>%as.vector(.)
+  w=W[v,,]%>%t(.)%>%as.vector(.)%>%na.omit(.)%>%as.vector()
   Omega=diag(w)
   for (t in 1:N){
     X_tilta[seq(from=t,to=(V-1)*N,by=N),seq(from=t,to=H_star*N,by=N)]=X_arr0[-v,,t]
 }
   Sigma_x0=t(X_tilta)%*%Omega%*%X_tilta+prior_sig_x
   Sigma_x=chol2inv(chol(Sigma_x0))
-  mu_x=t(X_tilta)%*%(Y_arr[-v,v,]%>%t(.)%>%as.vector()-0.5-w*rep(mu,V-1))
-  mu_x=Sigma_x%*%mu_x
+  mu_x0=t(X_tilta)%*%(Y_arr[v,,]%>%t(.)%>%as.vector(.)%>%na.omit(.)%>%as.vector()-0.5-w*rep(mu,V-1))
+  mu_x=Sigma_x%*%mu_x0
   X_mat=rmvnorm(n = 1,mean = mu_x,sigma = Sigma_x)%>%matrix(.,nrow=H_star,ncol=N,byrow=T)
   return(X_mat)
 }
@@ -167,15 +171,18 @@ for (t in 1:N){
 }
 #X_cache[,iter]=X_arr0%>%as.vector(),
 
-#sample tao,v:using X_longmat,v,
+#sample tao,v:using X_longmat,vv
 
 xKx=apply(X_longmat,1,function(x){t(x)%*%K_x_inv%*%x})%>%
-  matrix(.,nrow = V,ncol=H_star,byrow=T)%>%
-  apply(.,2,sum)
+  matrix(.,nrow = H_star,ncol=V)%>%
+  apply(.,1,sum)
 tao_1=c(1,vv[-1])%>%accumulate(.,prod)
 rate1=1+0.5*sum(tao_1*xKx)
 v1=rgamma(n = 1,shape = a1+V*N*H_star/2,rate = rate1)
-rate_l=map_dbl(1:(H_star-1),~map_dbl((.x+1):H_star,~prod(vv[1:.][-(.x+1)])*xKx[.])%>%sum(.))
+rate_l=vector(length = H_star-1)
+for (h in 2:H_star){
+  rate_l[h-1]=map_dbl(h:H_star,~prod(vv[1:.x][-h])*xKx[.x])%>%sum(.)
+}
 vl=map_dbl(2:H_star,~rgamma(n = 1,shape = a2+V*N*(H_star-.x+1)/2,rate = 1+0.5*rate_l[.x-1]))
 vv=c(v1,vl)
 tao=accumulate(vv,prod)
@@ -187,9 +194,8 @@ pi_arr_est_cache[,iter]=pi_vec
 
 p$tick()$print()
 }
-#MCMCres=list(W_est=W_cache,mu_est=mu_cache,X_est=X_cache,tao_est=tao_cache,pi_est=pi_arr_est_cache)
-MCMCres=pi_arr_est_cache
-save(MCMCres,file="MCMCres_seed456.RData")
+MCMCres=list(mu_est=mu_cache,pi_est=pi_arr_est_cache)
+save(MCMCres,file="MCMCres_sys_seed456.RData")
 #return(MCMCres)
 #}
 
@@ -197,32 +203,38 @@ save(MCMCres,file="MCMCres_seed456.RData")
 future=proc.time()
 future-now
 
-# 10 iteration 113s
-# 10 iteration 22s --improve X_tilta
-# 10 iteration 19s --reduce 2 for loop
 ```
 
 #posterior check
 ```{r}
 iter=5000
-load("MCMCres_seed456.RData")
+load("MCMCres_sys_seed456.RData")
 
-Pi_est=MCMCres
+Pi_est=MCMCres$pi_est
 ##decide the burnin
 ggdf=data_frame(index=1:iter,pi=Pi_est[iter,])
 ggplot(data=ggdf,mapping = aes(x = index,y = pi))+geom_line()
+
 effsize=apply(Pi_est,1,function(x){effectiveSize(as.mcmc(x))})
-iter-1
+
 hist(effsize)
 min(effsize)
 max(effsize)
 which.min(effsize)
+
+effsize_b=apply(Pi_est[,(burnin+1):niter],1,function(x){effectiveSize(as.mcmc(x))})
+hist(effsize_b)
+min(effsize_b)
+max(effsize_b)
+which.min(effsize_b)
 
 #without burnin. check the posterior
 #apply(a,c(2,3),sum) colsum
 pi_est_pos=Pi_est%>%apply(.,1,mean)
 pi_est_pos_arr=array(pi_est_pos,dim=c(V,V,N))
 for (t in 1:N){
+  diag(pi_est_pos_arr[,,t])=NA
+  diag(pi_arr[,,t])=NA
   mat=pi_est_pos_arr[,,t]
   colnames(mat)=paste0("col",1:V)
   rownames(mat)=paste0("row",1:V)
@@ -255,7 +267,7 @@ print(p)
 pi_true_vec=pi_arr%>%as.vector(.)
 pi_estimate_vec=pi_est_pos
 pi_ggdf=data_frame(true=pi_true_vec,estimate=pi_estimate_vec)
-ggplot(data = pi_ggdf,mapping = aes(x=true,y=estimate))+geom_point()
+ggplot(data = pi_ggdf,mapping = aes(x=true,y=estimate))+geom_point()+geom_abline(slope = 1,intercept = 0)+coord_equal(ratio=1)
 
 ##rm the diagonal
 pi_arr_rm=pi_arr
@@ -301,138 +313,6 @@ for (i in seq(0,1,by=0.1)){
 }
 ```
 
-
-
-
-
-
-## try some other prediction check
-
-```{r}
-#colsum for pi
-
-apply(a,c(2,3),sum)
-```
-
-#see the slowest part in update X_tilta: 
-
-create that weired matrix --  cannot be improved by mapreduce. need more efficient data structure.cannot bypass the problem by multiplication. Still have this form.
-sparse matrix multiplication is more efficient than this loop.
-
-```{r}
-benchmark(
-  X_tilta=matrix(0,nrow = (V-1)*N,ncol = H_star*N),
-  w=W[-v,v,]%>%t(.)%>%as.vector(.),
-  Omega=diag(w),
-  for (t in 1:N){
-    mat_s=matrix(0,nrow=N,ncol=N)
-    mat_s[t,t]=1
-    X_tilta=(X_arr0[-v,,t] %x% mat_s)+X_tilta
-  },
-  
-  Sigma_x0=t(X_tilta)%*%Omega%*%X_tilta+prior_sig_x,
-  Sigma_x=chol2inv(chol(Sigma_x0)),
-  mu_x=t(X_tilta)%*%(Y_arr[-v,v,]%>%t(.)%>%as.vector()-0.5-w*rep(mu,V-1)),
-  mu_x=Sigma_x%*%mu_x,
-  X_mat=rmvnorm(n = 1,mean = mu_x,sigma = Sigma_x)%>%matrix(.,nrow=H_star,ncol=N,byrow=T),
-  replications=20
-)%>%View(.)
-```
-
-
-# try to reduce loop
-
-```{r}
-assignment=function(){
-  S1=map(1:N,function(t){
-  X_arr0[,,t]%*%t(X_arr0[,,t])
-  #apply(S[,,t]+mu0[t],1,function(x){return(map_dbl(.x = x,.f = ~rpg_naive(z = .x)))})
-})
-  return(array(.))
-}
-benchmark(for(t in 1:N){
-  S[,,t]=X_arr0[,,t]%*%t(X_arr0[,,t])
-  W[,,t]=apply(S[,,t]+mu0[t],1,function(x){return(map_dbl(.x = x,.f = ~rpg_naive(z = .x)))})
-},
-
-S1=map(1:N,function(t){
-  X_arr0[,,t]%*%t(X_arr0[,,t])
-  #apply(S[,,t]+mu0[t],1,function(x){return(map_dbl(.x = x,.f = ~rpg_naive(z = .x)))})
-}),
-replications = 200
-)
-a_mat=matrix(rep(1:3,each=3),nrow=3)
-b_mat=matrix(rep(1:3,each=3),nrow=3,byrow=T)
-A_list=list(a_mat,b_mat)
-b=A_list %>% array(.,dim=c(3,3,2))
-map(1:2,function(t){
-  X_arr0[,,t]%*%t(X_arr0[,,t])
-  #apply(S[,,t]+mu0[t],1,function(x){return(map_dbl(.x = x,.f = ~rpg_naive(z = .x)))})
-})
-A_arr=array(dim=c(3,3,2))
-A_arr[,,1]=a_mat
-A_arr[,,2]=b_mat
-##map cannot 
-a_mat=matrix(nrow=3,ncol=3)
-a_mat[c(1,3),c(1,3)]=matrix(1:4,nrow=2,byrow=T)
-map(.x = 1:3,.f = function(x){a_mat[x,]=x+1})
-```
-
-```{r}
-a=benchmark(for (t in 1:N){
-    mat_s=matrix(0,nrow=N,ncol=N)
-    mat_s[t,t]=1
-    X_tilta1=(X_arr0[-v,,t] %x% mat_s)+X_tilta1
-},
-new(),
-replications = 20
-)
-View(a)
-new=function(){
-  X_tilta=matrix(0,nrow=(V-1)*N,ncol=H_star*N)
-  for (t in 1:N){
-    X_tilta[seq(from=t,to=(V-1)*N,by=N),seq(from=t,to=H_star*N,by=N)]=X_arr0[-v,,t]
-}
-}
-all.equal(X_tilta,X_tilta1)
-```
-
-```{r}
-benchmark(
-  ori(),
-testme(),
-replications = 40)%>%View(.)
-ori=function(){
-S=array(dim=c(V,V,N))
-for(t in 1:N){
-  S[,,t]=X_arr0[,,t]%*%t(X_arr0[,,t])
-  W[,,t]=apply(S[,,t]+mu0[t],1,function(x){return(map_dbl(.x = x,.f = ~rpg_naive(z = .x)))})
-}
-}
-
-for(t in 1:N){
-  S[,,t]=X_arr0[,,t]%*%t(X_arr0[,,t])}
-testme=function(){
-S=map(1:N,~X_arr0[,,.x]%*%t(X_arr0[,,.x]))
-W=map(1:N,~apply(S[[.x]]+mu0[.x],1,function(x){return(map_dbl(.x = x,.f = ~rpg_naive(z = .x)))}))
-W=W%>%unlist(.)%>%array(data = .,dim=c(V,V,N))}
-
-microbenchmark(
-for(h in 2:H_star){
-  rate_l[h-1]=map_dbl(h:H_star,~prod(vv[1:.][-h])*xKx[.])%>%sum(.)
-},
-rate_l=map_dbl(1:(H_star-1),~map_dbl((.x+1):H_star,~prod(vv[1:.][-(.x+1)])*xKx[.])%>%sum(.)),
-replications = 10
-)
-
-```
-
-#Note
-
-```{r}
-#may help 
-array_branch(x, 1) 
-```
 
 #burnin
 
@@ -495,3 +375,38 @@ for (i in seq(0,1,by=0.1)){
   abline(v=i,lty=2)
 }
 ```
+
+##mu(t)
+
+```{r}
+
+time = 1:N
+mu_ggdf=data_frame(time=time,mu_est=apply(MCMCres$mu_est,1,mean),lower=apply(MCMCres$mu_est,1,quantile,0.025),upper=apply(MCMCres$mu_est,1,quantile,0.975))
+
+ggplot(mu_ggdf, aes(x=time))+geom_line(mapping = aes(y=mu_est),linetype="dashed")+geom_ribbon(aes(ymin=lower,ymax=upper),fill="lightblue",alpha=0.3)+geom_line(mapping = aes(y=mu_true),data = data_frame(mu_true=mu))
+```
+
+##pij(t)
+
+```{r}
+
+pi_ggdf=data_frame(row=rep(1:V,V*N),col=rep(rep(1:V,each=V),N),time=rep(1:N,each=V*V),pi_est=apply(Pi_est[,(burnin+1):niter],1,mean),lower=apply(Pi_est[,(burnin+1):niter],1,quantile,0.025),upper=apply(Pi_est[,(burnin+1):niter],1,quantile,0.975))
+#pi_ggdf_w=data_frame(row=rep(1:V,V*N),col=rep(rep(1:V,each=V),N),time=rep(1:N,each=V*V),pi_est=apply(Pi_est,1,mean),lower=apply(Pi_est,1,quantile,0.025),upper=apply(Pi_est,1,quantile,0.975))
+for (i in 2:V){
+  for (j in 1:(i-1)){
+    piij_ggdf=pi_ggdf%>%filter(row==i,col==j)%>%select(-row,-col)
+    jpeg(filename=paste0("pi_burnin_",i,j,".jpeg"))
+p=ggplot(piij_ggdf, aes(x=time))+geom_line(mapping = aes(y=pi_est),linetype="dashed")+geom_ribbon(aes(ymin=lower,ymax=upper),fill="lightblue",alpha=0.3)+geom_line(mapping = aes(y=pi_true),data = data_frame(pi_true=pi_arr[i,j,]))
+print(p)
+  dev.off()
+  }
+}
+pi32_ggdf=pi_ggdf%>%filter(row==3,col==2)%>%select(-row,-col)
+ggplot(pi32_ggdf, aes(x=time))+geom_line(mapping = aes(y=pi_est),linetype="dashed")+geom_ribbon(aes(ymin=lower,ymax=upper),fill="lightblue",alpha=0.3)+geom_line(mapping = aes(y=pi_true),data = data_frame(pi_true=pi_arr[3,2,]))
+
+pi92_ggdf=pi_ggdf%>%filter(row==9,col==2)%>%select(-row,-col)
+ggplot(pi92_ggdf, aes(x=time))+geom_line(mapping = aes(y=pi_est),linetype="dashed")+geom_ribbon(aes(ymin=lower,ymax=upper),fill="lightblue",alpha=0.3)+geom_line(mapping = aes(y=pi_true),data = data_frame(pi_true=pi_arr[9,2,]))
+
+```
+
+
