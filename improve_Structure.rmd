@@ -25,6 +25,7 @@ library(microbenchmark)
 library("coda")
 library(ggplot2)
 theme_set(theme_bw())
+library(MCMCpack)
 ```
 
 ## SImulation dataset
@@ -62,7 +63,7 @@ for (t in 1:N){
 
 ```{r}
 #load("Y_arr_sys_sed123.RData")
-load("Y_arr_sys_sed111.RData")
+#load("Y_arr_sys_sed111.RData")
 ```
 
 
@@ -108,7 +109,7 @@ mu0=mvrnorm(n=1,mu=rep(0,N),Sigma = c_u0)
 v1=rgamma(n = 1,shape = a1,rate = 1)
 vl=rgamma(n = H_star-1,shape = a2,rate = 1) #(H_star-1)*1 vec
 vv=c(v1,vl)
-tao=accumulate(vv,prod)
+tao=accumulate(vv,prod) #in durante code: 1 1 1 1 1 .. as starting value
 X_arr0=array(dim=c(V,H_star,N))
 for(h in 1:H_star){
   X_arr0[,h,]=mvrnorm(n=V,mu=rep(0,N),Sigma = (1/tao[h])*c_x0)
@@ -123,10 +124,12 @@ mu_cache=matrix(nrow=N,ncol=niter)
 pi_arr_est_cache=matrix(nrow=V*V*N,ncol=niter)
 
 #preparation:transfer Y_arr to symmetric matrix without diagonal
+#for (t in 1:N){
+#  Y_arr[,,t][upper.tri(Y_arr[,,t])] = t(Y_arr[,,t])[upper.tri(Y_arr[,,t])]
+#}
 for (t in 1:N){
-  Y_arr[,,t][upper.tri(Y_arr[,,t])] = t(Y_arr[,,t])[upper.tri(Y_arr[,,t])]
+  Y_arr[,,t]=xpnd(vech(Y_arr[,,t]),V)
 }
-
 
 ##posterior
 for (iter in 1:niter){
@@ -147,8 +150,11 @@ mu_cache[,iter]=mu0
 
 #sample X_arr0:using tao,W,X_arr0
 prior_sig_x=diag(tao) %x% K_x_inv
+#for (t in 1:N){
+#  W[,,t][upper.tri(W[,,t])] = t(W[,,t])[upper.tri(W[,,t])]
+#}
 for (t in 1:N){
-  W[,,t][upper.tri(W[,,t])] = t(W[,,t])[upper.tri(W[,,t])]
+  W[,,t]=xpnd(vech(W[,,t]),V)
 }
 
 update_x=function(v){
@@ -160,7 +166,7 @@ update_x=function(v){
 }
   Sigma_x0=t(X_tilta)%*%Omega%*%X_tilta+prior_sig_x
   Sigma_x=chol2inv(chol(Sigma_x0))
-  mu_x0=t(X_tilta)%*%(Y_arr[v,,]%>%t(.)%>%as.vector(.)%>%na.omit(.)%>%as.vector()-0.5-w*rep(mu,V-1))
+  mu_x0=t(X_tilta)%*%(Y_arr[v,,]%>%t(.)%>%as.vector(.)%>%na.omit(.)%>%as.vector()-0.5-w*rep(mu0,V-1))
   mu_x=Sigma_x%*%mu_x0
   X_mat=rmvnorm(n = 1,mean = mu_x,sigma = Sigma_x)%>%matrix(.,nrow=H_star,ncol=N,byrow=T)
   return(X_mat)
@@ -354,6 +360,19 @@ pi92_ggdf=pi_ggdf%>%filter(row==9,col==2)%>%select(-row,-col)
 ggplot(pi92_ggdf, aes(x=time))+geom_line(mapping = aes(y=pi_est),linetype="dashed")+geom_ribbon(aes(ymin=lower,ymax=upper),fill="lightblue",alpha=0.3)+geom_line(mapping = aes(y=pi_true),data = data_frame(pi_true=pi_arr[9,2,]))
 
 
+```
+
+```{r}
+benchmark(
+  for (t in 1:N){
+  Y_arr1[,,t][upper.tri(Y_arr1[,,t])] = t(Y_arr1[,,t])[upper.tri(Y_arr1[,,t])]
+},
+for (t in 1:N){
+  Y_arr2[,,t]=xpnd(vech(Y_arr2[,,t]),V)
+},
+replications = 150
+)
+all(Y_arr1==Y_arr2,na.rm = TRUE)
 ```
 
 
