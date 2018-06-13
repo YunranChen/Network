@@ -26,6 +26,7 @@ library("coda")
 library(ggplot2)
 theme_set(theme_bw())
 library(MCMCpack)
+rm(list=ls())
 ```
 
 ## SImulation dataset
@@ -36,7 +37,7 @@ k_x=0.01
 N=40
 V=15
 H=2
-set.seed(111)
+set.seed(2)
 
 c_u=corr_matrix(X = 1:N,beta = log10(k_u),corr = list(type="exponential",power=2))
 c_x=corr_matrix(X = 1:N,beta = log10(k_x),corr = list(type="exponential",power=2))
@@ -106,9 +107,10 @@ K_mu_inv=chol2inv(chol(c_u0+diag(rep(1e-8,N)))) #inverse
 c_x0=corr_matrix(X = 1:N,beta = log10(k_x0),corr = list(type="exponential",power=2))
 K_x_inv=chol2inv(chol(c_x0+diag(rep(1e-8,N)))) #inverse
 mu0=mvrnorm(n=1,mu=rep(0,N),Sigma = c_u0)
-v1=rgamma(n = 1,shape = a1,rate = 1)
-vl=rgamma(n = H_star-1,shape = a2,rate = 1) #(H_star-1)*1 vec
-vv=c(v1,vl)
+#v1=rgamma(n = 1,shape = a1,rate = 1)
+#vl=rgamma(n = H_star-1,shape = a2,rate = 1) #(H_star-1)*1 vec
+#vv=c(v1,vl)
+vv=rep(1,H_star)
 tao=accumulate(vv,prod) #in durante code: 1 1 1 1 1 .. as starting value
 X_arr0=array(dim=c(V,H_star,N))
 for(h in 1:H_star){
@@ -157,7 +159,7 @@ for (t in 1:N){
   W[,,t]=xpnd(vech(W[,,t]),V)
 }
 
-update_x=function(v){
+for (v in 1:V){
   X_tilta=matrix(0,nrow = (V-1)*N,ncol = H_star*N)
   w=W[v,,]%>%t(.)%>%as.vector(.)%>%na.omit(.)%>%as.vector()
   Omega=diag(w)
@@ -166,51 +168,49 @@ update_x=function(v){
 }
   Sigma_x0=t(X_tilta)%*%Omega%*%X_tilta+prior_sig_x
   Sigma_x=chol2inv(chol(Sigma_x0))
-  mu_x0=t(X_tilta)%*%(Y_arr[v,,]%>%t(.)%>%as.vector(.)%>%na.omit(.)%>%as.vector()-0.5-w*rep(mu0,V-1))
+  y=Y_arr[v,,]%>%t(.)%>%as.vector(.)%>%na.omit(.)%>%as.vector()
+  mu_x0=t(X_tilta)%*%(y-0.5-w*rep(mu0,V-1))
   mu_x=Sigma_x%*%mu_x0
-  X_mat=rmvnorm(n = 1,mean = mu_x,sigma = Sigma_x)%>%matrix(.,nrow=H_star,ncol=N,byrow=T)
-  return(X_mat)
+  X_v=rmvnorm(n = 1,mean = mu_x,sigma = Sigma_x)
+  X_arr0[v,,]=matrix(data = X_v,nrow=H_star,byrow = TRUE)
+  
 }
-X_list=map(1:V,~update_x(.x))
-X_longmat=do.call(rbind,X_list)
-X_arr=array(X_longmat,dim=c(H_star,V,N))
-for (t in 1:N){
-  X_arr0[,,t]=t(X_arr[,,t])
-}
-#X_cache[,iter]=X_arr0%>%as.vector(),
 
-#sample tao,v:using X_longmat,vv
+#X_cache[,iter]=X_arr0%>%as.vector()
 
-xKx=apply(X_longmat,1,function(x){t(x)%*%K_x_inv%*%x})%>%
-  matrix(.,nrow = H_star,ncol=V)%>%
-  apply(.,1,sum)
+#sample tao,v:using Xr_arr0,Xs_arr0,vv
+xKx=map_dbl(.x = 1:H_star,.f = function(l){map_dbl(.x = 1:V,.f = ~ t(X_arr0[.x,l,])%*%K_x_inv%*%X_arr0[.x,l,])%>%sum(.)})
+
 tao_1=c(1,vv[-1])%>%accumulate(.,prod)
 rate1=1+0.5*sum(tao_1*xKx)
 v1=rgamma(n = 1,shape = a1+V*N*H_star/2,rate = rate1)
 rate_l=vector(length = H_star-1)
 for (h in 2:H_star){
-  rate_l[h-1]=map_dbl(h:H_star,~prod(vv[1:.x][-h])*xKx[.x])%>%sum(.)
+  rate_l[h-1]=map_dbl(h:H_star,~prod(vv[1:.x][-h])*xKx[.x])%>%sum(.)*0.5+1
 }
-vl=map_dbl(2:H_star,~rgamma(n = 1,shape = a2+V*N*(H_star-.x+1)/2,rate = 1+0.5*rate_l[.x-1]))
+vl=map_dbl(2:H_star,~rgamma(n = 1,shape = a2+V*N*(H_star-.x+1)/2,rate = rate_l[.x-1]))
 vv=c(v1,vl)
 tao=accumulate(vv,prod)
-#tao_cache[,iter]=tao
+tao_cache[,iter]=tao
+
+
 
 #calculate pi!!!Finally!!!:using X_arr0,mu0,
-pi_vec=map(1:N,~1/(1+exp(-(X_arr0[,,.x]%*%t(X_arr0[,,.x])+mu0[.x]))))%>%unlist(.)
+pi_vec=map(1:N,~1/(1+exp(-X_arr0[,,.x]%*%t(X_arr0[,,.x])-mu0[.x])))%>%unlist(.)
 pi_arr_est_cache[,iter]=pi_vec
 
 p$tick()$print()
 }
-MCMCres=list(mu_est=mu_cache,pi_est=pi_arr_est_cache)
-save(MCMCres,file="MCMCres_sys_seed456.RData")
+#MCMCres=list(mu_est=mu_cache,pi_est=pi_arr_est_cache)
+#save(MCMCres,file="MCMCres_sys_seed456.RData")
 #return(MCMCres)
 #}
 
 #givemeMCMC=MCMCme(N=40,V=15,H_star=10,k_u0=0.05,k_x0=0.05,a1=2,a2=2,niter=5000,burnin=1000,Y_arr=Y_arr)
+
 future=proc.time()
 future-now
-
+save.image(paste0("Asy_2_456",".RData"))
 ```
 
 # posterior check
@@ -218,7 +218,7 @@ future-now
 ```{r}
 #iter=5000
 #load("MCMCres_sys_seed456.RData")
-load("MCMCres_sys_seed456_111.RData")
+load("MCMCres_sys_seed2_456_vv.RData")
 Pi_est=MCMCres$pi_est[,(burnin+1):niter]
 pi_est_pos=Pi_est%>%apply(.,1,mean)
 pi_est_pos_arr=array(pi_est_pos,dim=c(V,V,N))
@@ -266,8 +266,8 @@ for (i in seq(0,1,by=0.1)){
 
 ```{r}
 ##decide the burnin
-ggdf=data_frame(index=1:iter,pi=Pi_est[iter,])
-ggplot(data=ggdf,mapping = aes(x = index,y = pi))+geom_line()
+#ggdf=data_frame(index=1:iter,pi=Pi_est[iter,])
+#ggplot(data=ggdf,mapping = aes(x = index,y = pi))+geom_line()
 
 effsize=apply(Pi_est,1,function(x){effectiveSize(as.mcmc(x))})
 
@@ -292,7 +292,7 @@ for (t in 1:N){
   longData_all=bind_rows(longData,longData_true)
   longData_all=as_tibble(longData_all)%>%mutate(index=as.factor(index))
   longData_all=longData_all%>%mutate(Var1=fct_rev(Var1))
-  jpeg(filename=paste0(t,"_seed111.jpeg"))
+  jpeg(filename=paste0(t,"_seed2.jpeg"))
 p=ggplot(longData_all, aes(x = Var2, y = Var1)) + 
   geom_raster(aes(fill=value)) + facet_wrap(~ index)+
   scale_fill_gradient(low="grey90", high="red") +
@@ -308,8 +308,8 @@ for (t in 1:N){
   mat=abs(pi_arr[,,t]-pi_est_pos_arr[,,t])
  colnames(mat)=paste0("col",1:V)
   rownames(mat)=paste0("row",1:V)
-  diff=melt(mat)
-  jpeg(filename=paste0("diff",t,"_seed111.jpeg"))
+  diff=melt(mat)%>%mutate(Var1=fct_rev(Var1))
+  jpeg(filename=paste0("diff",t,"_seed2.jpeg"))
 p=ggplot(diff, aes(x = Var2, y = Var1)) + 
   geom_raster(aes(fill=value)) +
   scale_fill_gradient(low="grey90", high="red") +
@@ -328,9 +328,10 @@ hist(diffs)
 ##mu(t)
 
 ```{r}
-
+ci_mu=HPDinterval(as.mcmc(t(mu_cache)), prob=0.95)
+ci_mu=ci_mu%>%as_tibble()
 time = 1:N
-mu_ggdf=data_frame(time=time,mu_est=apply(MCMCres$mu_est,1,mean),lower=apply(MCMCres$mu_est,1,quantile,0.025),upper=apply(MCMCres$mu_est,1,quantile,0.975))
+mu_ggdf=data_frame(time=time,mu_est=apply(mu_cache,1,mean),lower=ci_mu%>%pull(lower),upper=ci_mu%>%pull(upper))
 
 ggplot(mu_ggdf, aes(x=time))+geom_line(mapping = aes(y=mu_est),linetype="dashed")+geom_ribbon(aes(ymin=lower,ymax=upper),fill="lightblue",alpha=0.3)+geom_line(mapping = aes(y=mu_true),data = data_frame(mu_true=mu))
 ```
@@ -346,33 +347,18 @@ pi_ggdf=data_frame(row=rep(1:V,V*N),col=rep(rep(1:V,each=V),N),time=rep(1:N,each
 for (i in 2:V){
   for (j in 1:(i-1)){
     piij_ggdf=pi_ggdf%>%filter(row==i,col==j)%>%select(-row,-col)
-    jpeg(filename=paste0("pi_",i,j,"(t)_seed111.jpeg"))
+    jpeg(filename=paste0("pi_",i,j,"(t)_seed2.jpeg"))
 p=ggplot(piij_ggdf, aes(x=time))+geom_line(mapping = aes(y=pi_est),linetype="dashed")+geom_ribbon(aes(ymin=lower,ymax=upper),fill="lightblue",alpha=0.3)+geom_line(mapping = aes(y=pi_true),data = data_frame(pi_true=pi_arr[i,j,]))
 print(p)
   dev.off()
   }
 }
 
-pi32_ggdf=pi_ggdf%>%filter(row==3,col==2)%>%select(-row,-col)
-ggplot(pi32_ggdf, aes(x=time))+geom_line(mapping = aes(y=pi_est),linetype="dashed")+geom_ribbon(aes(ymin=lower,ymax=upper),fill="lightblue",alpha=0.3)+geom_line(mapping = aes(y=pi_true),data = data_frame(pi_true=pi_arr[3,2,]))
-
-pi92_ggdf=pi_ggdf%>%filter(row==9,col==2)%>%select(-row,-col)
-ggplot(pi92_ggdf, aes(x=time))+geom_line(mapping = aes(y=pi_est),linetype="dashed")+geom_ribbon(aes(ymin=lower,ymax=upper),fill="lightblue",alpha=0.3)+geom_line(mapping = aes(y=pi_true),data = data_frame(pi_true=pi_arr[9,2,]))
+#pi32_ggdf=pi_ggdf%>%filter(row==3,col==2)%>%select(-row,-col)
+#ggplot(pi32_ggdf, aes(x=time))+geom_line(mapping = #aes(y=pi_est),linetype="dashed")+geom_ribbon(aes(ymin=lower,ymax=upper),fill="lightblue#",alpha=0.3)+geom_line(mapping = aes(y=pi_true),data = #data_frame(pi_true=pi_arr[3,2,]))
+#
+#pi92_ggdf=pi_ggdf%>%filter(row==9,col==2)%>%select(-row,-col)
+#ggplot(pi92_ggdf, aes(x=time))+geom_line(mapping = #aes(y=pi_est),linetype="dashed")+geom_ribbon(aes(ymin=lower,ymax=upper),fill="lightblue#",alpha=0.3)+geom_line(mapping = aes(y=pi_true),data = #data_frame(pi_true=pi_arr[9,2,]))
 
 
 ```
-
-```{r}
-benchmark(
-  for (t in 1:N){
-  Y_arr1[,,t][upper.tri(Y_arr1[,,t])] = t(Y_arr1[,,t])[upper.tri(Y_arr1[,,t])]
-},
-for (t in 1:N){
-  Y_arr2[,,t]=xpnd(vech(Y_arr2[,,t]),V)
-},
-replications = 150
-)
-all(Y_arr1==Y_arr2,na.rm = TRUE)
-```
-
-
